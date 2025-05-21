@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+Análise Fiscal Completa - Streamlit App
+Autor: Antonio-BWA
+Repositório: https://github.com/Antonio-BWA/An-lise.git
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -5,435 +12,467 @@ from datetime import datetime
 import base64
 from io import BytesIO
 import xlsxwriter
-from pyxlsb import open_workbook as open_xlsb
 import zipfile
 import tempfile
 import os
+import subprocess
 
-# Configuração da página
-st.set_page_config(page_title="Segregação Fiscal", layout="wide")
+# =============================================
+# 1. CONFIGURAÇÃO INICIAL DO REPOSITÓRIO GIT
+# =============================================
 
-# Título da aplicação
-st.title("Segregação Fiscal")
+def init_git_repo():
+    """Inicializa o repositório Git se não existir"""
+    if not os.path.exists('.git'):
+        try:
+            subprocess.run(['git', 'init'], check=True)
+            if not os.path.exists('README.md'):
+                with open('README.md', 'w') as f:
+                    f.write("# Análise Fiscal\n\nAplicação para segregação de dados fiscais")
+            subprocess.run(['git', 'add', 'README.md'], check=True)
+            subprocess.run(['git', 'commit', '-m', 'primeiro commit'], check=True)
+            subprocess.run(['git', 'branch', '-M', 'main'], check=True)
+            subprocess.run(['git', 'remote', 'add', 'origin', 
+                          'https://github.com/Antonio-BWA/An-lise.git'], check=True)
+            subprocess.run(['git', 'push', '-u', 'origin', 'main'], check=True)
+            st.success("Repositório Git inicializado com sucesso!")
+        except subprocess.CalledProcessError as e:
+            st.warning(f"Erro ao configurar Git: {e}")
 
-# Variáveis de estado
-if 'processed_data' not in st.session_state:
-    st.session_state.processed_data = None
-if 'canceled_numbers' not in st.session_state:
-    st.session_state.canceled_numbers = set()
-if 'empresa_cnpj' not in st.session_state:
-    st.session_state.empresa_cnpj = None
-if 'devolucoes' not in st.session_state:
-    st.session_state.devolucoes = {
-        'possui': False,
-        'valores': {
-            '1202': 0,
-            '2202': 0,
-            '1411': 0,
-            '2411': 0
-        }
+# =============================================
+# 2. CONFIGURAÇÃO DA APLICAÇÃO
+# =============================================
+
+# Configuração segura do estado da sessão
+def setup_session_state():
+    """Garante que todas as variáveis de estado existam"""
+    defaults = {
+        'processed_data': None,
+        'canceled_numbers': set(),
+        'empresa_cnpj': None,
+        'devolucoes': {
+            'possui': False,
+            'valores': {'1202': 0, '2202': 0, '1411': 0, '2411': 0}
+        },
+        'show_devolucoes': False,
+        'file_uploaded': False
     }
+    
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-# Funções auxiliares
+# Inicialização segura
+try:
+    st.set_page_config(
+        page_title="Segregação Fiscal",
+        page_icon="📊",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    setup_session_state()
+    init_git_repo()
+except Exception as e:
+    st.error(f"Erro na inicialização: {str(e)}")
+    st.stop()
+
+# =============================================
+# 3. FUNÇÕES AUXILIARES
+# =============================================
+
 def format_number(value):
-    return f"{float(value or 0):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    """Formata números para exibição brasileira"""
+    try:
+        num = float(value or 0)
+        return f"{num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except:
+        return "0,00"
 
 def get_competencia_from_chave(chave):
+    """Extrai competência (MM-AA) da chave da NF-e"""
     if not chave or not isinstance(chave, str) or len(chave) < 44:
         return 'Desconhecido'
     try:
-        aamm = chave[2:6]
-        mes = aamm[2:4]
-        ano = aamm[0:2]
-        return f"{mes}-{ano}"
+        return f"{chave[4:6]}-{chave[2:4]}"
     except:
         return 'Desconhecido'
 
 def get_cnpj_from_chave(chave):
+    """Extrai CNPJ formatado da chave da NF-e"""
     if not chave or not isinstance(chave, str) or len(chave) < 44:
         return None
     try:
         cnpj = chave[6:20]
-        return format_cnpj(cnpj)
+        return f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:14]}"
     except:
         return None
 
-def format_cnpj(cnpj):
-    if not cnpj or len(cnpj) != 14:
-        return cnpj
-    return f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:14]}"
-
 def find_missing_numbers(doc_numbers):
-    if not doc_numbers or len(doc_numbers) == 0:
-        return []
-    
-    doc_numbers = [num for num in doc_numbers if num is not None]
+    """Identifica números faltantes na sequência"""
     if not doc_numbers:
         return []
     
-    min_doc = min(doc_numbers)
-    max_doc = max(doc_numbers)
-    all_numbers = set(doc_numbers)
-    missing_numbers = []
+    nums = [int(n) for n in doc_numbers if str(n).isdigit()]
+    if not nums:
+        return []
     
-    for i in range(min_doc, max_doc + 1):
-        if i not in all_numbers:
-            missing_numbers.append(i)
-    
-    return missing_numbers
+    return sorted(set(range(min(nums), max(nums) + 1)) - set(nums))
+
+# =============================================
+# 4. LÓGICA PRINCIPAL DE PROCESSAMENTO
+# =============================================
 
 def analyze_data(data):
+    """Processa os dados fiscais e calcula métricas"""
     df = pd.DataFrame(data)
-    
-    # Processar séries e números faltantes
-    series_data = {}
-    if 'ser' in df.columns and 'num_doc' in df.columns:
-        for serie, group in df.groupby('ser'):
-            series_data[serie or 'Única'] = find_missing_numbers(group['num_doc'].dropna().astype(int).tolist())
-    
-    # Inicializar resultados
     result = {
-        'missingNumbers': series_data,
-        'tributadoNormal': 0,
-        'tributadoMonofasico': 0,
-        'substitutoNormal': 0,
-        'substitutoMonofasico': 0,
+        'missingNumbers': {},
         'cfopTotals': {},
         'rawData': data,
         'hasDevolucoes': False
     }
     
-    # Processar CFOPs e valores
+    # Processa séries e números faltantes
+    if 'ser' in df.columns and 'num_doc' in df.columns:
+        for serie, group in df.groupby('ser'):
+            nums = group['num_doc'].dropna().astype(str).str.extract(r'(\d+)')[0]
+            if not nums.empty:
+                result['missingNumbers'][serie or 'Única'] = find_missing_numbers(nums.astype(int))
+
+    # Processa valores por CFOP
     if 'cfop' in df.columns and 'vl_item' in df.columns:
         df['cfop'] = df['cfop'].astype(str)
         df['vl_item'] = pd.to_numeric(df['vl_item'], errors='coerce').fillna(0)
-        
-        # Verificar se há devoluções
-        cfops_devolucao = ['1202', '2202', '1411', '2411']
-        result['hasDevolucoes'] = df['cfop'].isin(cfops_devolucao).any()
-        
-        # Totais por CFOP
         result['cfopTotals'] = df.groupby('cfop')['vl_item'].sum().to_dict()
         
-        # Processar categorias
+        # Categorias fiscais
         if 'monofasico' in df.columns:
-            df['monofasico'] = df['monofasico'].fillna(False)
             df['monofasico'] = df['monofasico'].astype(str).str.lower().isin(['true', 'sim', '1', 'yes'])
             
-            # Tributado Normal (5101, 5102, 6101, 6102)
             mask_trib = df['cfop'].isin(['5101', '5102', '6101', '6102'])
             result['tributadoNormal'] = df.loc[mask_trib & ~df['monofasico'], 'vl_item'].sum()
             result['tributadoMonofasico'] = df.loc[mask_trib & df['monofasico'], 'vl_item'].sum()
             
-            # Substituto (5405, 6404)
             mask_sub = df['cfop'].isin(['5405', '6404'])
             result['substitutoNormal'] = df.loc[mask_sub & ~df['monofasico'], 'vl_item'].sum()
             result['substitutoMonofasico'] = df.loc[mask_sub & df['monofasico'], 'vl_item'].sum()
     
-    # Calcular totais
-    result['totalFaturamento'] = (
-        result['tributadoNormal'] + result['tributadoMonofasico'] + 
-        result['substitutoNormal'] + result['substitutoMonofasico']
-    )
+    # Totais e devoluções
+    result['totalFaturamento'] = sum(result.get(k, 0) for k in [
+        'tributadoNormal', 'tributadoMonofasico', 
+        'substitutoNormal', 'substitutoMonofasico'
+    ])
     
-    # Adicionar devoluções manuais
-    total_devolucoes = 0
-    if st.session_state.devolucoes['possui']:
-        for cfop in ['1202', '2202', '1411', '2411']:
-            total_devolucoes += st.session_state.devolucoes['valores'][cfop]
-    
-    result['totalDevolucoes'] = total_devolucoes
+    result['totalDevolucoes'] = sum(st.session_state.devolucoes['valores'].values())
     result['totalLiquido'] = result['totalFaturamento'] - result['totalDevolucoes']
-    result['hasDevolucoes'] = result['hasDevolucoes'] or st.session_state.devolucoes['possui']
+    result['hasDevolucoes'] = any(df['cfop'].astype(str).str.startswith(('1202', '2202', '1411', '2411'))) or st.session_state.devolucoes['possui']
     
     return result
 
-# Upload do arquivo
-uploaded_file = st.file_uploader("Carregar Planilha", type=["xlsx", "xls"], 
-                                help="Arraste e solte seu arquivo Excel aqui ou clique para selecionar")
+# =============================================
+# 5. INTERFACE DO USUÁRIO
+# =============================================
 
-if uploaded_file:
-    try:
-        # Processar o arquivo
-        df = pd.read_excel(uploaded_file)
-        
-        # Encontrar CNPJ da empresa
-        if 'chv_nfe' in df.columns:
-            for chave in df['chv_nfe'].dropna():
-                cnpj = get_cnpj_from_chave(str(chave))
-                if cnpj:
-                    st.session_state.empresa_cnpj = cnpj
-                    break
-        
-        # Agrupar por competência
-        if 'chv_nfe' in df.columns:
-            df['competencia'] = df['chv_nfe'].apply(lambda x: get_competencia_from_chave(str(x)))
-        else:
-            st.warning("Coluna 'chv_nfe' não encontrada no arquivo. Não será possível determinar a competência.")
-            df['competencia'] = 'Desconhecido'
-        
-        # Processar dados por competência
-        st.session_state.processed_data = {}
-        for competencia, group in df.groupby('competencia'):
-            st.session_state.processed_data[competencia] = analyze_data(group.to_dict('records'))
-        
-        st.success("Arquivo processado com sucesso!")
-        
-    except Exception as e:
-        st.error(f"Erro ao processar o arquivo: {str(e)}")
+# CSS Customizado
+st.markdown("""
+<style>
+    .stApp { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+    .stButton>button { transition: all 0.3s; }
+    .stButton>button:hover { transform: scale(1.02); }
+    .negative-value { color: #e74c3c !important; }
+    .highlight-row { background-color: #e3f2fd !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# Título principal
+st.title("📊 Segregação Fiscal")
+st.markdown("---")
+
+# Upload de arquivo
+with st.container():
+    uploaded_file = st.file_uploader(
+        "Carregue sua planilha fiscal (Excel)",
+        type=["xlsx", "xls"],
+        accept_multiple_files=False,
+        key="file_uploader"
+    )
+    
+    if uploaded_file and not st.session_state.file_uploaded:
+        with st.spinner("Processando dados..."):
+            try:
+                df = pd.read_excel(uploaded_file)
+                
+                # Identifica CNPJ
+                if 'chv_nfe' in df.columns:
+                    for chave in df['chv_nfe'].dropna().astype(str):
+                        cnpj = get_cnpj_from_chave(chave)
+                        if cnpj:
+                            st.session_state.empresa_cnpj = cnpj
+                            break
+                
+                # Processa por competência
+                df['competencia'] = df['chv_nfe'].apply(
+                    lambda x: get_competencia_from_chave(str(x)))
+                
+                st.session_state.processed_data = {}
+                for competencia, group in df.groupby('competencia'):
+                    st.session_state.processed_data[competencia] = analyze_data(group.to_dict('records'))
+                
+                st.session_state.file_uploaded = True
+                st.success("Dados processados com sucesso!")
+                
+            except Exception as e:
+                st.error(f"Erro ao processar arquivo: {str(e)}")
+                st.stop()
 
 # Seção de devoluções
-if st.session_state.processed_data:
-    if st.button("Devoluções"):
-        st.session_state.show_devolucoes = not st.session_state.get('show_devolucoes', False)
-    
-    if st.session_state.get('show_devolucoes', False):
-        st.subheader("Informe os valores das devoluções por CFOP:")
+if st.session_state.processed_data and st.button("📥 Devoluções"):
+    st.session_state.show_devolucoes = not st.session_state.show_devolucoes
+
+if st.session_state.show_devolucoes:
+    with st.expander("🔧 Ajuste de Devoluções", expanded=True):
+        cols = st.columns(4)
+        cfops = {
+            '1202': cols[0],
+            '2202': cols[1], 
+            '1411': cols[2],
+            '2411': cols[3]
+        }
         
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            dev_1202 = st.number_input("CFOP 1202", min_value=0.0, step=0.01, format="%.2f")
-        with col2:
-            dev_2202 = st.number_input("CFOP 2202", min_value=0.0, step=0.01, format="%.2f")
-        with col3:
-            dev_1411 = st.number_input("CFOP 1411", min_value=0.0, step=0.01, format="%.2f")
-        with col4:
-            dev_2411 = st.number_input("CFOP 2411", min_value=0.0, step=0.01, format="%.2f")
+        for cfop, col in cfops.items():
+            with col:
+                st.session_state.devolucoes['valores'][cfop] = st.number_input(
+                    f"CFOP {cfop}",
+                    min_value=0.0,
+                    value=st.session_state.devolucoes['valores'].get(cfop, 0.0),
+                    step=0.01,
+                    format="%.2f"
+                )
         
-        if st.button("Confirmar Valores"):
-            st.session_state.devolucoes = {
-                'possui': True,
-                'valores': {
-                    '1202': dev_1202,
-                    '2202': dev_2202,
-                    '1411': dev_1411,
-                    '2411': dev_2411
-                }
-            }
-            
-            # Reprocessar os dados com as devoluções
+        if st.button("✅ Confirmar Valores"):
+            st.session_state.devolucoes['possui'] = True
             for competencia in st.session_state.processed_data:
                 st.session_state.processed_data[competencia] = analyze_data(
                     st.session_state.processed_data[competencia]['rawData']
                 )
-            
-            st.success("Valores de devolução atualizados!")
             st.session_state.show_devolucoes = False
+            st.rerun()
 
-# Exibir resultados
+# Exibição de resultados
 if st.session_state.processed_data:
-    if st.session_state.empresa_cnpj:
-        st.info(f"CNPJ da Empresa: {st.session_state.empresa_cnpj}")
+    st.markdown("---")
     
-    competencias = sorted(st.session_state.processed_data.keys(), 
-                         key=lambda x: datetime.strptime(x, '%m-%y') if x != 'Desconhecido' else datetime.min)
+    if st.session_state.empresa_cnpj:
+        st.info(f"**CNPJ Identificado:** {st.session_state.empresa_cnpj}")
+    
+    competencias = sorted(
+        st.session_state.processed_data.keys(),
+        key=lambda x: (int(x.split('-')[1]), int(x.split('-')[0])) if x != 'Desconhecido' else (0, 0)
+    )
     
     for competencia in competencias:
         comp_data = st.session_state.processed_data[competencia]
         
-        with st.expander(f"Competência: {competencia.replace('-', '/')}", expanded=True):
-            # Tabela de totais por categoria
-            st.subheader("Totais por Categoria")
+        with st.expander(f"🗓️ Competência: {competencia.replace('-', '/')}", expanded=True):
+            # Tabela de categorias
+            st.subheader("📈 Totais por Categoria")
             
             categories = [
-                ("Tributado Normal", comp_data['tributadoNormal'], False),
-                ("Tributado Monofásico", comp_data['tributadoMonofasico'], False),
-                ("Substituto Normal", comp_data['substitutoNormal'], False),
-                ("Substituto Monofásico", comp_data['substitutoMonofasico'], False),
-                ("TOTAL FATURAMENTO", comp_data['totalFaturamento'], True)
+                ("Tributado Normal", comp_data.get('tributadoNormal', 0), False),
+                ("Tributado Monofásico", comp_data.get('tributadoMonofasico', 0), False),
+                ("Substituto Normal", comp_data.get('substitutoNormal', 0), False),
+                ("Substituto Monofásico", comp_data.get('substitutoMonofasico', 0), False),
+                ("TOTAL FATURAMENTO", comp_data.get('totalFaturamento', 0), True)
             ]
             
-            if comp_data['hasDevolucoes']:
-                if comp_data['totalDevolucoes'] > 0:
+            if comp_data.get('hasDevolucoes', False):
+                if comp_data.get('totalDevolucoes', 0) > 0:
                     categories.append(("TOTAL DEVOLUÇÕES", -comp_data['totalDevolucoes'], True))
-                categories.append(("TOTAL LÍQUIDO", comp_data['totalLiquido'], True))
+                categories.append(("TOTAL LÍQUIDO", comp_data.get('totalLiquido', 0), True))
             
-            # Criar DataFrame para exibição
-            df_categories = pd.DataFrame(categories, columns=["Categoria", "Valor", "Destaque"])
-            df_categories["Valor (R$)"] = df_categories["Valor"].apply(format_number)
+            # Exibição formatada
+            for name, value, highlight in categories:
+                cols = st.columns([3, 1])
+                with cols[0]:
+                    st.markdown(f"{'**' if highlight else ''}{name}{'**' if highlight else ''}")
+                with cols[1]:
+                    st.markdown(
+                        f"{'**' if highlight else ''}"
+                        f"{'<span class=negative-value>' if value < 0 else ''}"
+                        f"R$ {format_number(abs(value) if value < 0 else value)}"
+                        f"{'</span>' if value < 0 else ''}"
+                        f"{'**' if highlight else ''}",
+                        unsafe_allow_html=True
+                    )
             
-            # Adicionar formatação para valores negativos
-            def highlight_negative(val):
-                if val < 0:
-                    return 'color: red'
-                return ''
-            
-            styled_df = df_categories[["Categoria", "Valor (R$)"]].style.applymap(
-                lambda x: 'font-weight: bold' if x in ["TOTAL FATURAMENTO", "TOTAL LÍQUIDO", "TOTAL DEVOLUÇÕES"] else ''
-            ).applymap(
-                lambda x: 'color: red' if '-' in x else ''
-            )
-            
-            st.dataframe(styled_df, use_container_width=True, hide_index=True)
+            st.markdown("---")
             
             # Tabela de CFOPs
-            st.subheader("Totais por CFOP")
+            st.subheader("🏷️ Totais por CFOP")
             
             cfop_data = []
-            for cfop in sorted(comp_data['cfopTotals'].keys()):
+            for cfop in sorted(comp_data.get('cfopTotals', {}).keys()):
                 cfop_data.append((cfop, comp_data['cfopTotals'][cfop]))
             
-            # Adicionar devoluções manuais
-            if st.session_state.devolucoes['possui'] and comp_data['totalDevolucoes'] > 0:
+            if st.session_state.devolucoes['possui']:
                 for cfop in ['1202', '2202', '1411', '2411']:
                     if st.session_state.devolucoes['valores'][cfop] > 0:
                         cfop_data.append((f"{cfop} (Devolução)", st.session_state.devolucoes['valores'][cfop]))
             
             df_cfop = pd.DataFrame(cfop_data, columns=["CFOP", "Valor"])
-            df_cfop["Valor (R$)"] = df_cfop["Valor"].apply(format_number)
+            st.dataframe(
+                df_cfop.style.format({"Valor": lambda x: f"R$ {format_number(x)}"}),
+                use_container_width=True,
+                hide_index=True
+            )
             
-            st.dataframe(df_cfop[["CFOP", "Valor (R$)"]], use_container_width=True, hide_index=True)
+            st.markdown("---")
             
             # Documentos faltantes
-            st.subheader("Documentos Faltantes por Série")
+            st.subheader("🔍 Documentos Faltantes por Série")
             
-            total_faltante = sum(len(nums) for nums in comp_data['missingNumbers'].values())
-            st.write(f"Total faltante: {total_faltante}")
+            total_faltante = sum(len(nums) for nums in comp_data.get('missingNumbers', {}).values())
+            st.write(f"**Total de documentos faltantes:** {total_faltante}")
             
-            for serie in sorted(comp_data['missingNumbers'].keys()):
+            for serie in sorted(comp_data.get('missingNumbers', {}).keys()):
                 missing_numbers = comp_data['missingNumbers'][serie]
                 if not missing_numbers:
                     continue
                 
-                with st.expander(f"Série {serie} - {len(missing_numbers)} faltantes"):
-                    # Criar checkboxes para marcar como cancelado/inutilizado
+                with st.expander(f"📂 Série {serie} - {len(missing_numbers)} faltantes"):
                     cols = st.columns(5)
                     col_idx = 0
                     
                     for num in sorted(missing_numbers):
                         key = f"{competencia}-{serie}-{num}"
                         with cols[col_idx]:
-                            if st.checkbox(str(num), key=key, 
-                                         value=key in st.session_state.canceled_numbers):
+                            if st.checkbox(
+                                str(num),
+                                key=key,
+                                value=key in st.session_state.canceled_numbers
+                            ):
                                 st.session_state.canceled_numbers.add(key)
                             else:
                                 st.session_state.canceled_numbers.discard(key)
-                        
                         col_idx = (col_idx + 1) % 5
 
-# Botões de exportação
+# =============================================
+# 6. EXPORTAÇÃO DE RESULTADOS
+# =============================================
+
 if st.session_state.processed_data:
+    st.markdown("---")
+    st.subheader("📤 Exportar Resultados")
+    
     col1, col2 = st.columns(2)
     
     with col1:
-        if st.button("Exportar para Excel"):
+        if st.button("💾 Exportar para Excel"):
             try:
-                # Criar um arquivo Excel
                 output = BytesIO()
-                writer = pd.ExcelWriter(output, engine='xlsxwriter')
-                
-                # Resumo de todas as competências
-                resumo_data = []
-                for competencia in st.session_state.processed_data:
-                    comp_data = st.session_state.processed_data[competencia]
+                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                    # Resumo
+                    resumo_data = []
+                    for competencia in st.session_state.processed_data:
+                        comp_data = st.session_state.processed_data[competencia]
+                        resumo = {
+                            "Competência": competencia.replace('-', '/'),
+                            "Tributado Normal": comp_data.get('tributadoNormal', 0),
+                            "Tributado Monofásico": comp_data.get('tributadoMonofasico', 0),
+                            "Substituto Normal": comp_data.get('substitutoNormal', 0),
+                            "Substituto Monofásico": comp_data.get('substitutoMonofasico', 0),
+                            "Total Faturamento": comp_data.get('totalFaturamento', 0),
+                            "Documentos Faltantes": sum(len(nums) for nums in comp_data.get('missingNumbers', {}).values())
+                        }
+                        if comp_data.get('hasDevolucoes', False):
+                            resumo.update({
+                                "Total Devoluções": comp_data.get('totalDevolucoes', 0),
+                                "Total Líquido": comp_data.get('totalLiquido', 0)
+                            })
+                        resumo_data.append(resumo)
                     
-                    resumo = {
-                        "CNPJ": st.session_state.empresa_cnpj or "Não identificado",
-                        "Competência": competencia.replace('-', '/'),
-                        "Tributado Normal": comp_data['tributadoNormal'],
-                        "Tributado Monofásico": comp_data['tributadoMonofasico'],
-                        "Substituto Normal": comp_data['substitutoNormal'],
-                        "Substituto Monofásico": comp_data['substitutoMonofasico'],
-                        "Total Faturamento": comp_data['totalFaturamento'],
-                        "Total Devoluções": comp_data['totalDevolucoes'] if comp_data['hasDevolucoes'] else 0,
-                        "Documentos Faltantes": sum(len(nums) for nums in comp_data['missingNumbers'].values())
-                    }
+                    pd.DataFrame(resumo_data).to_excel(writer, sheet_name="RESUMO", index=False)
                     
-                    if comp_data['hasDevolucoes']:
-                        resumo["Total Líquido"] = comp_data['totalLiquido']
-                    
-                    resumo_data.append(resumo)
-                
-                pd.DataFrame(resumo_data).to_excel(writer, sheet_name="RESUMO", index=False)
-                
-                # Planilha para cada competência
-                for competencia in st.session_state.processed_data:
-                    comp_data = st.session_state.processed_data[competencia]
-                    
-                    # Criar dados para a planilha
-                    excel_data = []
-                    
-                    excel_data.append(["RELATÓRIO DE ANÁLISE FISCAL"])
-                    excel_data.append(["CNPJ:", st.session_state.empresa_cnpj or "Não identificado"])
-                    excel_data.append(["Competência:", competencia.replace('-', '/')])
-                    excel_data.append([""])
-                    
-                    excel_data.append(["TOTAIS POR CATEGORIA"])
-                    excel_data.append(["Categoria", "Valor Total"])
-                    excel_data.append(["Tributado Normal", comp_data['tributadoNormal']])
-                    excel_data.append(["Tributado Monofásico", comp_data['tributadoMonofasico']])
-                    excel_data.append(["Substituto Normal", comp_data['substitutoNormal']])
-                    excel_data.append(["Substituto Monofásico", comp_data['substitutoMonofasico']])
-                    excel_data.append(["TOTAL FATURAMENTO", comp_data['totalFaturamento']])
-                    
-                    if comp_data['hasDevolucoes']:
-                        if comp_data['totalDevolucoes'] > 0:
-                            excel_data.append(["TOTAL DEVOLUÇÕES", -comp_data['totalDevolucoes']])
-                        excel_data.append(["TOTAL LÍQUIDO", comp_data['totalLiquido']])
-                    
-                    excel_data.append([""])
-                    
-                    excel_data.append(["TOTAIS POR CFOP"])
-                    excel_data.append(["CFOP", "Valor Total"])
-                    for cfop in sorted(comp_data['cfopTotals'].keys()):
-                        excel_data.append([cfop, comp_data['cfopTotals'][cfop]])
-                    
-                    if st.session_state.devolucoes['possui'] and comp_data['totalDevolucoes'] > 0:
-                        for cfop in ['1202', '2202', '1411', '2411']:
-                            if st.session_state.devolucoes['valores'][cfop] > 0:
-                                excel_data.append([f"{cfop} (Devolução)", st.session_state.devolucoes['valores'][cfop]])
-                    
-                    excel_data.append([""])
-                    
-                    excel_data.append(["DOCUMENTOS FALTANTES POR SÉRIE"])
-                    excel_data.append(["Série", "Número", "Status"])
-                    
-                    for serie in sorted(comp_data['missingNumbers'].keys()):
-                        missing_numbers = comp_data['missingNumbers'][serie]
-                        if not missing_numbers:
-                            continue
+                    # Planilhas por competência
+                    for competencia in st.session_state.processed_data:
+                        comp_data = st.session_state.processed_data[competencia]
                         
-                        for num in sorted(missing_numbers):
-                            key = f"{competencia}-{serie}-{num}"
-                            status = "CANC/INUT" if key in st.session_state.canceled_numbers else "FALTANTE"
-                            excel_data.append([serie, num, status])
-                    
-                    if len(excel_data) <= 12:
-                        excel_data.append(["Nenhum número faltante na sequência."])
-                    
-                    # Criar DataFrame e salvar na planilha
-                    df_sheet = pd.DataFrame(excel_data)
-                    sheet_name = competencia if len(competencia) <= 31 else competencia[:31]
-                    df_sheet.to_excel(writer, sheet_name=sheet_name, index=False, header=False)
+                        excel_data = []
+                        excel_data.append(["RELATÓRIO DE ANÁLISE FISCAL"])
+                        excel_data.append(["CNPJ:", st.session_state.empresa_cnpj or "Não identificado"])
+                        excel_data.append(["Competência:", competencia.replace('-', '/')])
+                        excel_data.append([""])
+                        
+                        # Categorias
+                        excel_data.append(["TOTAIS POR CATEGORIA"])
+                        excel_data.append(["Categoria", "Valor Total"])
+                        excel_data.append(["Tributado Normal", comp_data.get('tributadoNormal', 0)])
+                        excel_data.append(["Tributado Monofásico", comp_data.get('tributadoMonofasico', 0)])
+                        excel_data.append(["Substituto Normal", comp_data.get('substitutoNormal', 0)])
+                        excel_data.append(["Substituto Monofásico", comp_data.get('substitutoMonofasico', 0)])
+                        excel_data.append(["TOTAL FATURAMENTO", comp_data.get('totalFaturamento', 0)])
+                        
+                        if comp_data.get('hasDevolucoes', False):
+                            if comp_data.get('totalDevolucoes', 0) > 0:
+                                excel_data.append(["TOTAL DEVOLUÇÕES", -comp_data['totalDevolucoes']])
+                            excel_data.append(["TOTAL LÍQUIDO", comp_data.get('totalLiquido', 0)])
+                        
+                        excel_data.append([""])
+                        
+                        # CFOPs
+                        excel_data.append(["TOTAIS POR CFOP"])
+                        excel_data.append(["CFOP", "Valor Total"])
+                        for cfop in sorted(comp_data.get('cfopTotals', {}).keys()):
+                            excel_data.append([cfop, comp_data['cfopTotals'][cfop]])
+                        
+                        if st.session_state.devolucoes['possui']:
+                            for cfop in ['1202', '2202', '1411', '2411']:
+                                if st.session_state.devolucoes['valores'][cfop] > 0:
+                                    excel_data.append([f"{cfop} (Devolução)", st.session_state.devolucoes['valores'][cfop]])
+                        
+                        excel_data.append([""])
+                        
+                        # Faltantes
+                        excel_data.append(["DOCUMENTOS FALTANTES POR SÉRIE"])
+                        excel_data.append(["Série", "Número", "Status"])
+                        
+                        for serie in sorted(comp_data.get('missingNumbers', {}).keys()):
+                            for num in sorted(comp_data['missingNumbers'][serie]):
+                                key = f"{competencia}-{serie}-{num}"
+                                status = "CANC/INUT" if key in st.session_state.canceled_numbers else "FALTANTE"
+                                excel_data.append([serie, num, status])
+                        
+                        if len(excel_data) <= 12:
+                            excel_data.append(["Nenhum número faltante na sequência."])
+                        
+                        pd.DataFrame(excel_data).to_excel(
+                            writer,
+                            sheet_name=competencia[:31],
+                            index=False,
+                            header=False
+                        )
                 
-                # Salvar o arquivo
-                writer.close()
                 output.seek(0)
-                
-                # Criar link de download
                 st.download_button(
-                    label="Baixar arquivo Excel",
+                    label="⬇️ Baixar Arquivo Excel",
                     data=output,
-                    file_name="SEGREGAÇÃO_FISCAL.xlsx",
+                    file_name="segregacao_fiscal.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
                 
             except Exception as e:
-                st.error(f"Erro ao exportar para Excel: {str(e)}")
+                st.error(f"Erro na exportação: {str(e)}")
     
     with col2:
-        if st.button("Exportar para PDF"):
+        if st.button("📄 Exportar para PDF"):
             try:
-                # Para PDF, você pode usar reportlab ou outra biblioteca
-                # Como exemplo, vamos criar um arquivo ZIP com HTMLs que podem ser convertidos para PDF
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    zip_filename = os.path.join(tmpdir, "RELATORIO_FISCAL.zip")
+                    zip_path = os.path.join(tmpdir, "relatorio_fiscal.zip")
                     
-                    with zipfile.ZipFile(zip_filename, 'w') as zipf:
+                    with zipfile.ZipFile(zip_path, 'w') as zipf:
                         for competencia in st.session_state.processed_data:
                             comp_data = st.session_state.processed_data[competencia]
                             
-                            # Criar conteúdo HTML para cada competência
                             html_content = f"""
                             <!DOCTYPE html>
                             <html>
@@ -441,7 +480,7 @@ if st.session_state.processed_data:
                                 <meta charset="UTF-8">
                                 <title>Relatório Fiscal - {competencia}</title>
                                 <style>
-                                    body {{ font-family: Arial; margin: 20px; }}
+                                    body {{ font-family: Arial; margin: 2cm; }}
                                     h1 {{ color: #2c3e50; text-align: center; }}
                                     table {{ width: 100%; border-collapse: collapse; margin: 15px 0; }}
                                     th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
@@ -453,38 +492,46 @@ if st.session_state.processed_data:
                             <body>
                                 <h1>Relatório Fiscal - Competência: {competencia.replace('-', '/')}</h1>
                                 <p><strong>CNPJ:</strong> {st.session_state.empresa_cnpj or "Não identificado"}</p>
-                                <p><strong>Emitido em:</strong> {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
+                                <p><strong>Data:</strong> {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
                                 
                                 <h2>Totais por Categoria</h2>
                                 <table>
                                     <tr><th>Categoria</th><th>Valor (R$)</th></tr>
                             """
                             
-                            # Adicionar categorias
-                            categories = [
-                                ("Tributado Normal", comp_data['tributadoNormal'], False),
-                                ("Tributado Monofásico", comp_data['tributadoMonofasico'], False),
-                                ("Substituto Normal", comp_data['substitutoNormal'], False),
-                                ("Substituto Monofásico", comp_data['substitutoMonofasico'], False),
-                                ("TOTAL FATURAMENTO", comp_data['totalFaturamento'], True)
-                            ]
-                            
-                            if comp_data['hasDevolucoes']:
-                                if comp_data['totalDevolucoes'] > 0:
-                                    categories.append(("TOTAL DEVOLUÇÕES", -comp_data['totalDevolucoes'], True))
-                                categories.append(("TOTAL LÍQUIDO", comp_data['totalLiquido'], True))
-                            
-                            for name, value, highlight in categories:
-                                negative_class = "negative" if value < 0 else ""
-                                highlight_class = "highlight" if highlight else ""
+                            # Adiciona categorias
+                            for name, value, _ in [
+                                ("Tributado Normal", comp_data.get('tributadoNormal', 0), False),
+                                ("Tributado Monofásico", comp_data.get('tributadoMonofasico', 0), False),
+                                ("Substituto Normal", comp_data.get('substitutoNormal', 0), False),
+                                ("Substituto Monofásico", comp_data.get('substitutoMonofasico', 0), False),
+                                ("TOTAL FATURAMENTO", comp_data.get('totalFaturamento', 0), True)
+                            ]:
                                 html_content += f"""
-                                    <tr>
-                                        <td class="{highlight_class}">{name}</td>
-                                        <td class="{negative_class} {highlight_class}">{format_number(abs(value)) if value < 0 else format_number(value)}</td>
-                                    </tr>
+                                <tr>
+                                    <td{' class="highlight"' if name.startswith('TOTAL') else ''}>{name}</td>
+                                    <td{' class="negative"' if value < 0 else ''}>
+                                        {format_number(abs(value)) if value < 0 else format_number(value)}
+                                    </td>
+                                </tr>
                                 """
                             
-                            # Adicionar CFOPs
+                            if comp_data.get('hasDevolucoes', False):
+                                if comp_data.get('totalDevolucoes', 0) > 0:
+                                    html_content += f"""
+                                    <tr>
+                                        <td class="highlight">TOTAL DEVOLUÇÕES</td>
+                                        <td class="negative">{format_number(comp_data['totalDevolucoes'])}</td>
+                                    </tr>
+                                    """
+                                html_content += f"""
+                                <tr>
+                                    <td class="highlight">TOTAL LÍQUIDO</td>
+                                    <td>{format_number(comp_data.get('totalLiquido', 0))}</td>
+                                </tr>
+                                """
+                            
+                            # Adiciona CFOPs
                             html_content += """
                                 </table>
                                 
@@ -493,25 +540,25 @@ if st.session_state.processed_data:
                                     <tr><th>CFOP</th><th>Valor (R$)</th></tr>
                             """
                             
-                            for cfop in sorted(comp_data['cfopTotals'].keys()):
+                            for cfop in sorted(comp_data.get('cfopTotals', {}).keys()):
                                 html_content += f"""
-                                    <tr>
-                                        <td>{cfop}</td>
-                                        <td>{format_number(comp_data['cfopTotals'][cfop])}</td>
-                                    </tr>
+                                <tr>
+                                    <td>{cfop}</td>
+                                    <td>{format_number(comp_data['cfopTotals'][cfop])}</td>
+                                </tr>
                                 """
                             
-                            if st.session_state.devolucoes['possui'] and comp_data['totalDevolucoes'] > 0:
+                            if st.session_state.devolucoes['possui']:
                                 for cfop in ['1202', '2202', '1411', '2411']:
                                     if st.session_state.devolucoes['valores'][cfop] > 0:
                                         html_content += f"""
-                                            <tr>
-                                                <td>{cfop} (Devolução)</td>
-                                                <td>{format_number(st.session_state.devolucoes['valores'][cfop])}</td>
-                                            </tr>
+                                        <tr>
+                                            <td>{cfop} (Devolução)</td>
+                                            <td>{format_number(st.session_state.devolucoes['valores'][cfop])}</td>
+                                        </tr>
                                         """
                             
-                            # Adicionar documentos faltantes
+                            # Adiciona documentos faltantes
                             html_content += """
                                 </table>
                                 
@@ -519,32 +566,34 @@ if st.session_state.processed_data:
                             """
                             
                             has_missing = False
-                            for serie in sorted(comp_data['missingNumbers'].keys()):
+                            for serie in sorted(comp_data.get('missingNumbers', {}).keys()):
                                 missing_numbers = comp_data['missingNumbers'][serie]
                                 if not missing_numbers:
                                     continue
                                 
                                 has_missing = True
                                 html_content += f"""
-                                    <h3>Série {serie}</h3>
-                                    <p>Total faltante: {len(missing_numbers)}</p>
-                                    <div style="display: flex; flex-wrap: wrap; gap: 5px;">
+                                <h3>Série {serie}</h3>
+                                <p>Total faltante: {len(missing_numbers)}</p>
+                                <div style="margin-bottom: 20px;">
                                 """
                                 
                                 for num in sorted(missing_numbers):
                                     key = f"{competencia}-{serie}-{num}"
                                     if key in st.session_state.canceled_numbers:
                                         html_content += f"""
-                                            <div style="background-color: #ff9999; padding: 3px 8px; 
-                                                border-radius: 3px; text-decoration: line-through;">
-                                                {num} (CANC/INUT)
-                                            </div>
+                                        <span style="display: inline-block; background-color: #ff9999; 
+                                            padding: 3px 8px; margin: 2px; border-radius: 3px; 
+                                            text-decoration: line-through;">
+                                            {num} (CANC/INUT)
+                                        </span>
                                         """
                                     else:
                                         html_content += f"""
-                                            <div style="background-color: #ffeb3b; padding: 3px 8px; border-radius: 3px;">
-                                                {num}
-                                            </div>
+                                        <span style="display: inline-block; background-color: #ffeb3b; 
+                                            padding: 3px 8px; margin: 2px; border-radius: 3px;">
+                                            {num}
+                                        </span>
                                         """
                                 
                                 html_content += "</div>"
@@ -557,20 +606,36 @@ if st.session_state.processed_data:
                                 </html>
                             """
                             
-                            # Salvar HTML no arquivo ZIP
-                            filename = f"RELATORIO_{competencia.replace('-', '_')}.html"
+                            # Salva no ZIP
+                            filename = f"relatorio_{competencia.replace('-', '_')}.html"
                             zipf.writestr(filename, html_content)
                     
-                    # Criar link de download
-                    with open(zip_filename, "rb") as f:
+                    # Cria botão de download
+                    with open(zip_path, "rb") as f:
                         st.download_button(
-                            label="Baixar relatórios em HTML (para PDF)",
+                            label="⬇️ Baixar Relatórios (HTML para PDF)",
                             data=f,
-                            file_name="RELATORIO_FISCAL.zip",
+                            file_name="relatorio_fiscal.zip",
                             mime="application/zip"
                         )
                 
-                st.info("Para converter para PDF, baixe o ZIP, extraia os arquivos HTML e use o navegador para imprimir como PDF.")
-                
+                st.info("Para converter para PDF: baixe o ZIP, extraia os arquivos HTML e use 'Imprimir como PDF' no navegador.")
+            
             except Exception as e:
-                st.error(f"Erro ao gerar PDF: {str(e)}")
+                st.error(f"Erro na geração do PDF: {str(e)}")
+
+# =============================================
+# 7. RODAPÉ E INFORMAÇÕES ADICIONAIS
+# =============================================
+
+st.markdown("---")
+st.markdown("""
+<div style="text-align: center; margin-top: 2rem; color: #666;">
+    <p>Aplicação desenvolvida por <strong>Antonio-BWA</strong></p>
+    <p>Repositório: <a href="https://github.com/Antonio-BWA/An-lise.git" target="_blank">github.com/Antonio-BWA/An-lise</a></p>
+</div>
+""", unsafe_allow_html=True)
+
+# Verificação final
+if st.sidebar.checkbox("Mostrar estado da sessão (debug)"):
+    st.sidebar.write(st.session_state)
